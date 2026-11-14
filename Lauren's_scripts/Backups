@@ -1,0 +1,19 @@
+MariaDB:
+
+**Do not run from inside Mariadb
+Take the backup:
+•	mariadb-dump -u root -p --single-transaction --quick test_database | gzip > test_database_backup.sql.gz
+
+Restore the backup:
+•	gunzip < test_database_backup.sql.gz | mariadb -u root -p test_database
+
+
+Rocky Configs:
+Create the backup:
+•	sudo tar -czvf /root/etc-backup-$(date +%F).tar.gz /etc
+
+Restore a file from the archive:
+•	sudo tar -xzvf /root/etc-backup-YYYY-MM-DD.tar.gz -C / path/to/specific/file
+
+List all backups in /root:
+•	sudo ls -lh /root/*.tar.gz
