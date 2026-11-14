@@ -1,0 +1,114 @@
+Accounts, Passwords, Permissions
+
+Switch to root account:
+•	su -
+
+Change password of account currently logged into: 
+•	Passwd
+
+Change password of account not logged into:
+•	Sudo passwd accountUsername
+
+List all accounts:
+•	Cat /etc/passwd
+
+List accounts that can sign in:
+•	awk -F: '$7 !~ /(nologin|false)$/ {print $1, $7}' /etc/passwd
+
+List only usernames:
+•	Cut -d: -f1 /etc/passwd
+
+Check what members are in the wheel group:
+•	getent group wheel
+
+Remove a user from the wheel group: 	
+•	gpasswd -d username wheel
+
+Add user to the wheel group:
+•	sudo usermod -aG wheel username
+
+
+
+
+IP, Addresses, Ports:
+IP address:
+•	ip -br addr
+
+Default gateway and routing:
+•	ip route
+
+List all ports with services listening:
+•	sudo ss -tulnp
+
+Apache: port 80/443
+SSH: port 22
+Mariadb: port 3306
+Check which ports the firewall allows:
+•	sudo firewall-cmd –state
+
+Check current config of SSH:
+•	sudo sshd -T | grep -E 'permitrootlogin|passwordauthentication|pubkeyauthentication'
+
+Check the SSH service:
+•	sudo systemctl status sshd
+
+Disable Root SSH:  ** make sure the user account is in the wheel group before
+•	sudo nano /etc/ssh/sshd_config		//open the config file
+•	change the PermitRootLogin yes to no
+•	sudo sshd -t				//validate the configuration
+•	sudo systemctl reload sshd		//reload ssh
+•	sudo sshd -T | grep permitrootlogin	//test
+
+Firewalld close ports:
+•	sudo firewall-cmd --permanent --remove-port=PORT/PROTOCOL
+
+Firewalld open ports:
+•	sudo firewall-cmd --permanent --add-port=PORT/PROTOCOL
+
+Firewalld after changes:
+•	sudo firewall-cmd --reload
+•	sudo firewall-cmd --list-ports      	// lists open ports
+•	sudo firewall-cmd --list-all   	// lists open ports and allowed services
+
+
+
+MariaDB:
+Built in security configuration:
+•	sudo mariadb-secure-installation
+
+Bind MariaDB to localhost:
+•	sudo nano /etc/my.cnf.d/mariadb-server.cnf	//open the config file
+•	[mysqld]				//find this
+•	bind-address = 127.0.0.1		//under [mysqld] write this
+•	sudo systemctl restart mariadb		//restart the db
+•	sudo systemctl status mariadb		//verify it started again
+•	sudo ss -tulpn | grep 3306		//verify the binding
+
+Enter the db:
+•	sudo mariadb -u root -p
+•	SHOW DATABASES;
+•	CREATE DATABASE test_database;
+•	USE test_database;
+•	SHOW TABLES;
+•	DROP DATABASE test_database;
+•	Exit;
+
+
+
+Webpage:
+Check that the webpage is running:
+if curl --output /dev/null --silent --head --fail "http://localhost/your-page.html"; then
+  echo "Webpage is up"
+else
+  echo "Webpage is down"
+fi
+
+Verify the Apache Service:
+•	sudo systemctl status httpd
+  o	look for Active: active (running)
+•	sudo ss -tulpn | grep httpd 
+  o	check listening ports (80-443)
+
+
+
+
