@@ -1,24 +1,30 @@
 #!/bin/bash
 # ecom-audit.sh - read-only security and health check for the Rocky Linux
-# e-commerce box (Apache + PHP-FPM + MariaDB + OpenCart).
+# e-commerce box: nginx in front of a nopCommerce (.NET) store, whose database
+# is Microsoft SQL Server on another machine.
 #
 # It changes NOTHING on the system. It only looks, prints what it finds, and
 # saves a log plus a snapshot in /root/audit. Run it again later and the
 # "CHANGES SINCE LAST RUN" section shows what is different (new users, new
-# ports, edited website files, new admins...).
+# ports, new store admins, changed app files...).
 #
 # Usage:   sudo bash ecom-audit.sh
 # Read the [!!] lines in the SUMMARY at the bottom first.
 
 # ---------- Settings: edit these to match the box ----------
-WEBROOT=/var/www/html
-DB_NAME=opencart
-DB_PREFIX=oc_
-EXPECTED_LOGIN_USERS="root ecomuser"            # accounts allowed to log in
-EXPECTED_ADMINS="ecomuser"                      # accounts allowed in wheel (sudo)
-EXPECTED_PORTS="22 80 443 68 546"               # ports allowed open to the network
-EXPECTED_FW_SERVICES="ssh http https dhcpv6-client"
-EXPECTED_DB_USERS="root ocuser bkpuser mysql mariadb.sys"
+APP_DIR=/var/www/nopcommerce              # nopCommerce app folder
+APP_SERVICE=""                            # systemd service running the app (blank = find it automatically)
+APP_USER=nopcommerce                      # account the app runs as
+APP_PORT=5000                             # local port the app listens on (nginx forwards to it)
+EXPECTED_LOGIN_USERS="root sysadmin"      # accounts allowed to log in
+EXPECTED_ADMINS="sysadmin"                # accounts allowed in wheel (sudo)
+EXPECTED_PORTS="80 443 161"               # ports allowed open to the network (161 = SNMP; add 22 if SSH is needed)
+EXPECTED_FW_SERVICES="ssh http https snmp dhcpv6-client"
+# outgoing connections that are normal for this box, as program:port
+EXPECTED_OUTBOUND="dotnet:1433 sssd_be:389 sssd_be:636 sssd_be:88 sssd_be:3268 splunkd:9997 splunkd:8089"
+SQLCMD=/opt/mssql-tools18/bin/sqlcmd      # SQL Server command-line tool (optional)
+BACKUP_DIR=/root/backups
+# The database server, name and login are read from the app's connection string.
 # ------------------------------------------------------------
 
 if [ "$(id -u)" -ne 0 ]; then echo "Run as root: sudo bash $0"; exit 1; fi
@@ -66,6 +72,12 @@ unowned() {
 # commands attackers use for reverse shells, droppers and miners
 SUSP_RE='/dev/(tcp|udp)/|\b(nc|ncat|netcat|socat|xmrig|chisel)\b|\b(ba)?sh -i\b|mkfifo|python[0-9.]* -c|perl -e|php -r|base64 -d|(curl|wget)[^|]*\|[[:space:]]*(ba)?sh'
 
+# find the systemd service that runs the store (whatever owns the app port)
+if [ -z "$APP_SERVICE" ] || ! systemctl cat "$APP_SERVICE" >/dev/null 2>&1; then
+  pid=$(ss -H -tlnp "sport = :$APP_PORT" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -n 1 | cut -d= -f2)
+  [ -n "$pid" ] && APP_SERVICE=$(ps -o unit= -p "$pid" 2>/dev/null | tr -d ' ')
+fi
+
 printf '%sE-commerce box audit (read-only) | %s | %s%s\n' "$BLU" "$(hostname)" "$(date '+%F %T')" "$NC"
 info "Takes about 30 seconds."
 
@@ -83,7 +95,7 @@ done < <(df -P / /var /tmp 2>/dev/null | awk 'NR > 1 {print $5, $6}' | sort -u)
 # ==========================================================================
 section "USERS AND SUDO"
 awk -F: '$7 !~ /(nologin|false|sync|shutdown|halt)$/ {print $1" (uid "$3", "$7")"}' /etc/passwd | sort > "$SNAP/login-users.txt"
-info "Accounts that can log in:"; indent < "$SNAP/login-users.txt"
+info "Local accounts that can log in:"; indent < "$SNAP/login-users.txt"
 while read -r u _; do
   in_list "$u" "$EXPECTED_LOGIN_USERS" || warn "Unexpected account that can log in: $u"
 done < "$SNAP/login-users.txt"
@@ -119,7 +131,7 @@ for f in /var/spool/cron/*; do
 done
 grep -vE '^[[:space:]]*(#|$)|^[A-Z_]+=' /etc/crontab 2>/dev/null | sed 's|^|/etc/crontab: |' >> "$SNAP/crontabs.txt"
 info "Cron jobs:"; if [ -s "$SNAP/crontabs.txt" ]; then indent < "$SNAP/crontabs.txt"; else echo "     none"; fi
-warn_each "Cron job (check it)" < <(grep -v '/root/bin/backup.sh' "$SNAP/crontabs.txt")
+warn_each "Cron job (check it)" < <(grep -v 'backup' "$SNAP/crontabs.txt")
 
 mapfile -t cronfiles < <(find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly -maxdepth 1 -type f 2>/dev/null)
 printf '%s\n' "${cronfiles[@]}" | sort > "$SNAP/cron-files.txt"
@@ -133,7 +145,9 @@ info "Enabled at boot:"; paste -sd' ' "$SNAP/enabled-services.txt" | fold -s -w 
 mapfile -t units < <(find /etc/systemd/system /usr/lib/systemd/system /usr/local/lib/systemd/system /run/systemd/system -maxdepth 2 -type f \
   \( -name '*.service' -o -name '*.timer' -o -name '*.socket' -o -name '*.path' -o -path '*.d/*.conf' \) 2>/dev/null)
 unowned "${units[@]}" | sort > "$SNAP/unowned-units.txt"
-warn_each "Service/timer not from any package (someone added it)" < "$SNAP/unowned-units.txt"
+info "Services/timers not from any package (the store and Splunk are expected here; anything else, check):"
+if [ -s "$SNAP/unowned-units.txt" ]; then indent < "$SNAP/unowned-units.txt"; else echo "     none"; fi
+warn_each "Service/timer not from any package (someone added it?)" < <(grep -viE "nopcommerce|${APP_SERVICE:-nopcommerce}|splunk" "$SNAP/unowned-units.txt")
 
 if [ -x /etc/rc.d/rc.local ] && grep -vE '^[[:space:]]*(#|$)|^touch /var/lock/subsys/local' /etc/rc.d/rc.local | grep -q .; then
   warn "rc.local runs commands at boot"; show "grep -vE '^[[:space:]]*(#|$)' /etc/rc.d/rc.local"
@@ -153,18 +167,20 @@ while read -r proto addr proc; do
   port=${addr##*:}; host=${addr%:*}
   listen_ports+="$port "
   case "$host" in 127.*|"[::1]"|::1|*%lo) continue ;; esac
-  if [ "$port" = 3306 ]; then warn "MariaDB (3306) is open to the network; it should be localhost only ($proc)"; continue; fi
+  if [ "$port" = "$APP_PORT" ]; then warn "Store app port $APP_PORT is open to the network; it should be localhost only ($proc)"; continue; fi
   in_list "$port" "$EXPECTED_PORTS" || warn "Unexpected open port: $proto $addr ($proc)"
 done < "$SNAP/listening.txt"
 
 info "Established connections:"
 ss -H -tnp state established 2>/dev/null | awk '{print $3, $4, ($NF ~ /users:/ ? $NF : "unknown-process")}' | sed -E 's/users:\(\("([^"]+)",pid=([0-9]+).*/\1(pid=\2)/' > "$SNAP/.established"
 if [ -s "$SNAP/.established" ]; then indent < "$SNAP/.established"; else echo "     none"; fi
-warn_each "Outgoing connection (fine if it's your browser or dnf; otherwise a reverse shell?)" < <(
+warn_each "Unexpected outgoing connection (your browser or dnf is fine; otherwise a reverse shell?)" < <(
   while read -r local peer proc; do
-    lport=${local##*:}; phost=${peer%:*}
+    lport=${local##*:}; phost=${peer%:*}; pport=${peer##*:}
     case "$phost" in 127.*|"[::1]"|::1|"[::ffff:127."*) continue ;; esac
-    in_list "$lport" "$listen_ports" || echo "${proc%(pid=*} -> $peer"
+    in_list "$lport" "$listen_ports" && continue
+    in_list "${proc%(pid=*}:$pport" "$EXPECTED_OUTBOUND" && continue
+    echo "${proc%(pid=*} -> $peer"
   done < "$SNAP/.established" | sort -u)
 rm -f "$SNAP/.established"
 
@@ -185,8 +201,8 @@ fi
 
 # ==========================================================================
 section "PROCESSES"
-show "ps -eo pid,user,%cpu,%mem,args --sort=-%cpu | head -n 8 | cut -c1-150"
-PS=$(ps -eo pid=,user=,args= 2>/dev/null)
+show "ps -eo pid,user:14,%cpu,%mem,args --sort=-%cpu | head -n 8 | cut -c1-150"
+PS=$(ps -eo pid=,user:24=,args= 2>/dev/null)
 tmp_procs=""; deleted_procs=""
 for p in /proc/[0-9]*; do
   exe=$(readlink "$p/exe" 2>/dev/null) || continue
@@ -199,102 +215,142 @@ done
 warn_each "Program running from a temp or hidden folder" <<< "$tmp_procs"
 warn_each "Program running from a deleted file (normal right after updates, otherwise suspicious)" < <(sort -u <<< "$deleted_procs")
 warn_each "Suspicious command running" < <(grep -E "$SUSP_RE" <<< "$PS" | grep -v 'ecom-audit' | cut -c1-150)
-warn_each "Web server account running a non-web program (web shell?)" < <(awk '$2 == "apache"' <<< "$PS" | grep -vE '^[[:space:]]*[0-9]+ +apache +(/usr/sbin/httpd|php-fpm)' | cut -c1-150)
+warn_each "Store account running something other than the store (code execution through the site?)" < <(
+  awk -v u="$APP_USER" '$2 == u' <<< "$PS" | grep -vE '^[[:space:]]*[0-9]+ +[^ ]+ +[^ ]*dotnet( |$)' | cut -c1-150)
+warn_each "nginx account running something other than nginx" < <(
+  awk '$2 == "nginx"' <<< "$PS" | grep -vE '^[[:space:]]*[0-9]+ +nginx +nginx: ' | cut -c1-150)
 
 # ==========================================================================
-section "WEB SERVER AND OPENCART"
-for s in httpd php-fpm; do
-  if systemctl is-active --quiet "$s"; then ok "$s is running"; else warn "$s is NOT running"; fi
-done
-if have httpd; then
-  out=$(httpd -t 2>&1)
-  if grep -q 'Syntax OK' <<< "$out"; then ok "Apache config syntax OK"; else warn "Apache config test failed"; indent <<< "$out"; fi
+section "WEB (NGINX + NOPCOMMERCE)"
+if systemctl is-active --quiet nginx; then ok "nginx is running"; else warn "nginx is NOT running"; fi
+if [ -n "$APP_SERVICE" ] && [ "$APP_SERVICE" != "-" ]; then
+  if systemctl is-active --quiet "$APP_SERVICE"; then ok "Store app ($APP_SERVICE) is running"; else warn "Store app ($APP_SERVICE) is NOT running"; fi
+else
+  warn "Could not find the store's service (nothing on port $APP_PORT?). Set APP_SERVICE at the top."
 fi
-for path in / /admin/; do
-  code=$(curl -s --noproxy '*' -o /dev/null -m 5 -w '%{http_code}' "http://localhost$path")
+if have nginx; then
+  out=$(nginx -t 2>&1)
+  if grep -q 'test is successful' <<< "$out"; then ok "nginx config test passed"; else warn "nginx config test failed"; indent <<< "$out"; fi
+fi
+for url in "http://127.0.0.1:$APP_PORT/" "https://localhost/" "https://localhost/login"; do
+  code=$(curl -sk --noproxy '*' -o /dev/null -m 15 -w '%{http_code}' "$url")
   case "$code" in
-    200|301|302) ok "http://localhost$path answers $code" ;;
-    *) warn "http://localhost$path answers ${code:-nothing} (store may be down)" ;;
+    200|301|302) ok "$url answers $code" ;;
+    *) warn "$url answers ${code:-nothing} (store may be down)" ;;
   esac
 done
-title=$(curl -s --noproxy '*' -m 5 http://localhost/ | grep -oiE '<title>[^<]*' | head -n 1 | sed 's/<title>//I')
+title=$(curl -skL --noproxy '*' -m 15 https://localhost/ | grep -oiE '<title>[^<]*' | head -n 1 | sed 's/<title>//I')
 info "Storefront page title: ${title:-none}"
 echo "$title" > "$SNAP/store-title.txt"
 
-[ -d "$WEBROOT/install" ] && warn "$WEBROOT/install still exists (delete it)"
-warn_each "PHP file in an image/upload folder (web shell?)" < <(find "$WEBROOT/image" "$WEBROOT/system/storage/upload" "$WEBROOT/system/storage/download" -type f -iname '*.ph*' 2>/dev/null)
-WS_RE='eval[[:space:]]*\([[:space:]]*(base64_decode|gzinflate|gzuncompress|str_rot13|\$_(GET|POST|REQUEST|COOKIE))|(system|shell_exec|passthru|popen|proc_open|assert|exec)[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE|SERVER)|`[[:space:]]*\$_(GET|POST|REQUEST|COOKIE)'
-warn_each "Possible web shell" < <(grep -rlE --include='*.ph*' "$WS_RE" "$WEBROOT" 2>/dev/null)
+if [ -d "$APP_DIR" ]; then
+  # folders the store rewrites on its own (thumbnails, bundles, temp uploads)
+  EXCL=( -path "$APP_DIR/wwwroot/images/thumbs" -o -path "$APP_DIR/wwwroot/bundles" -o -path "$APP_DIR/App_Data/TempUploads"
+         -o -path "$APP_DIR/App_Data/DataProtectionKeys" -o -path "$APP_DIR/App_Data/Logs" -o -path "$APP_DIR/wwwroot/files/exportimport" -o -path "$APP_DIR/logs" )
+  warn_each "Code file in an upload folder (web shell?)" < <(find "$APP_DIR/wwwroot/images" "$APP_DIR/wwwroot/files" -type f \
+    \( -iname '*.php*' -o -iname '*.asp*' -o -iname '*.ashx' -o -iname '*.cshtml' -o -iname '*.dll' -o -iname '*.exe' -o -iname '*.so' -o -iname '*.sh' -o -iname '*.py' -o -iname '*.pl' -o -iname '*.jsp' \) 2>/dev/null)
+  warn_each "Script file a .NET store doesn't use" < <(find "$APP_DIR" \( "${EXCL[@]}" \) -prune -o -type f \( -iname '*.php*' -o -iname '*.jsp' -o -iname '*.sh' -o -iname '*.py' -o -iname '*.pl' \) -print 2>/dev/null)
+  warn_each "Store file changed in the last 2 hours (plugins in $APP_DIR/Plugins matter most)" < <(find "$APP_DIR" \( "${EXCL[@]}" \) -prune -o -type f -mmin -120 -print 2>/dev/null)
+  warn_each "World-writable file in the store" < <(find "$APP_DIR" -perm -o+w ! -type l 2>/dev/null)
+  info "$(find "$APP_DIR" -user "$APP_USER" -name '*.dll' 2>/dev/null | wc -l) store DLLs are owned by $APP_USER (that account can rewrite the store's code)"
+  info "$(find "$APP_DIR/Plugins" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) plugin folders in $APP_DIR/Plugins"
+  find "$APP_DIR" \( "${EXCL[@]}" \) -prune -o -type f -print0 2>/dev/null | xargs -0 -r sha256sum \
+    | sed -E 's/^([0-9a-f]{16})[0-9a-f]*  (.*)$/\2  \1/' | sort > "$SNAP/store-files.txt"
+  info "Fingerprinted $(wc -l < "$SNAP/store-files.txt") store files (next run shows any that change)"
+else
+  warn "Store folder $APP_DIR not found. Set APP_DIR at the top."
+fi
+nginx -T 2>/dev/null | grep -vE '^[[:space:]]*(#|$)' > "$SNAP/nginx-config.txt"
 
-EXCL=( -path "$WEBROOT/system/storage/cache" -o -path "$WEBROOT/system/storage/session"
-       -o -path "$WEBROOT/system/storage/logs" -o -path "$WEBROOT/image/cache" )
-warn_each "Website file changed in the last 2 hours" < <(find "$WEBROOT" \( "${EXCL[@]}" \) -prune -o -type f -mmin -120 -print 2>/dev/null)
-warn_each "World-writable file in the website" < <(find "$WEBROOT" -perm -o+w ! -type l 2>/dev/null)
-warn_each "Web server account can edit site code" < <(find "$WEBROOT" \( -path "$WEBROOT/image" -o -path "$WEBROOT/system/storage" \) -prune -o -user apache ! -name config.php -print 2>/dev/null)
-for f in "$WEBROOT/config.php" "$WEBROOT/admin/config.php"; do [ -f "$f" ] && info "$(stat -c '%A %U:%G' "$f") $f"; done
-find "$WEBROOT" \( "${EXCL[@]}" \) -prune -o -type f -print0 2>/dev/null | xargs -0 -r sha256sum \
-  | sed -E 's/^([0-9a-f]{16})[0-9a-f]*  (.*)$/\2  \1/' | sort > "$SNAP/website-files.txt"
-info "Fingerprinted $(wc -l < "$SNAP/website-files.txt") website files (next run shows any that change)"
-
-AL=/var/log/httpd/access_log; EL=/var/log/httpd/error_log
+AL=/var/log/nginx/access.log; EL=/var/log/nginx/error.log
 if [ -f "$AL" ]; then
   info "Top client IPs:"; awk '{print $1}' "$AL" | sort | uniq -c | sort -rn | head -n 5 | indent
-  ATTACK_RE='\.\./|%2e%2e|/etc/passwd|union[^a-z]+select|<script|%3cscript|cmd=|base64_decode|phpinfo|/bin/(ba)?sh|sqlmap|nikto|nmap|gobuster|dirbuster|wp-login'
+  info "Login attempts (POST /login) by IP:"; grep '"POST /login' "$AL" | awk '{print $1}' | sort | uniq -c | sort -rn | head -n 5 | indent
+  ATTACK_RE='\.\./|%2e%2e|/etc/passwd|union[^a-z]+select|<script|%3cscript|cmd=|/bin/(ba)?sh|\.php|\.aspx?|\.jsp|\.env|\.git/|sqlmap|nikto|nmap|gobuster|dirbuster|wp-login'
   warn_each "Attack-looking request" < <(grep -vE '^(127\.0\.0\.1|::1) ' "$AL" | grep -iE "$ATTACK_RE" | tail -n 10 | cut -c1-170)
-  warn_each "POST to an unusual PHP file (web shell use?)" < <(grep '"POST ' "$AL" | grep -vE '"POST /(admin/)?index\.php[?" ]' | tail -n 10 | cut -c1-170)
 fi
-[ -f "$EL" ] && { info "Last Apache errors:"; tail -n 6 "$EL" | cut -c1-170 | indent; }
-OCLOG="$WEBROOT/system/storage/logs/error.log"
-[ -s "$OCLOG" ] && { info "Last OpenCart errors:"; tail -n 5 "$OCLOG" | cut -c1-170 | indent; }
+[ -f "$EL" ] && { info "Last nginx errors:"; tail -n 6 "$EL" | cut -c1-170 | indent; }
+if [ -n "$APP_SERVICE" ] && [ "$APP_SERVICE" != "-" ]; then
+  info "Last store app log lines:"; journalctl -u "$APP_SERVICE" -n 6 --no-pager -o cat 2>/dev/null | cut -c1-170 | indent
+fi
 
 # ==========================================================================
-section "DATABASE (MARIADB)"
-if systemctl is-active --quiet mariadb; then ok "mariadb is running"; else warn "mariadb is NOT running"; fi
-DBMODE=""
-if [ -r /root/.backup.cnf ] && mysql --defaults-extra-file=/root/.backup.cnf --connect-timeout=5 -e 'SELECT 1' >/dev/null 2>&1; then
-  DBMODE=cnf
-elif mysql --connect-timeout=5 -e 'SELECT 1' >/dev/null 2>&1; then
-  DBMODE=socket
-elif [ -t 0 ]; then
-  read -rsp "MariaDB root password (press Enter to skip database checks): " MYSQL_PWD; echo
-  export MYSQL_PWD
-  [ -n "$MYSQL_PWD" ] && mysql -u root --connect-timeout=5 -e 'SELECT 1' >/dev/null 2>&1 && DBMODE="pwd"
-fi
-q() {
-  case "$DBMODE" in
-    cnf)    mysql --defaults-extra-file=/root/.backup.cnf -N -B --connect-timeout=5 -e "$1" ;;
-    socket) mysql -N -B --connect-timeout=5 -e "$1" ;;
-    pwd)    mysql -u root -N -B --connect-timeout=5 -e "$1" ;;
-  esac 2>/dev/null
+section "STORE DATABASE (MSSQL)"
+CONF=""
+for f in "$APP_DIR/App_Data/appsettings.json" "$APP_DIR/App_Data/dataSettings.json"; do
+  [ -z "$CONF" ] && grep -qi 'connectionstring' "$f" 2>/dev/null && CONF=$f
+done
+CS=""
+[ -n "$CONF" ] && CS=$(grep -ohiE '"(Data)?ConnectionString"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONF" | head -n 1 | sed -E 's/^[^:]*:[[:space:]]*"//; s/"$//; s/\\\\/\\/g')
+# read one setting (by any of its names) out of the connection string
+cs_get() {
+  tr ';' '\n' <<< "$CS" | awk -v keys="$1" 'BEGIN { n = split(keys, k, "|") }
+    { key = $0; sub(/=.*/, "", key); gsub(/^[ \t]+|[ \t]+$/, "", key)
+      for (i = 1; i <= n; i++) if (tolower(key) == k[i]) { val = $0; sub(/^[^=]*=/, "", val); gsub(/^[ \t]+|[ \t]+$/, "", val); print val; exit } }'
 }
-if [ -z "$DBMODE" ]; then
-  warn "Could not log in to MariaDB, database checks skipped"
+if [ -z "$CS" ]; then
+  warn "Could not find the store's connection string in $APP_DIR/App_Data"
 else
-  q "SELECT CONCAT(user,'@',host) FROM mysql.user ORDER BY 1" > "$SNAP/db-users.txt"
-  info "Database accounts:"; indent < "$SNAP/db-users.txt"
-  while IFS='@' read -r u h; do
-    if [ -z "$u" ]; then warn "Anonymous database account @$h"; continue; fi
-    in_list "$u" "$EXPECTED_DB_USERS" || warn "Unexpected database account: $u@$h"
-    case "$h" in localhost|127.0.0.1|::1) ;; *) warn "Database account allowed from the network: $u@$h" ;; esac
-  done < "$SNAP/db-users.txt"
-  warn_each "Database account with admin-level privileges" < <(q "SELECT CONCAT(user,'@',host) FROM mysql.user WHERE (Super_priv='Y' OR Grant_priv='Y' OR File_priv='Y' OR Create_user_priv='Y') AND user NOT IN ('root','mariadb.sys','mysql')")
-  q "SHOW GRANTS FOR 'ocuser'@'localhost'" > "$SNAP/ocuser-grants.txt"
-  info "ocuser permissions:"; indent < "$SNAP/ocuser-grants.txt"
-  warn_each "ocuser has rights beyond the store database" < <(grep 'ON \*\.\*' "$SNAP/ocuser-grants.txt" | grep -v 'GRANT USAGE')
+  info "Connection string is in $CONF ($(stat -c '%A %U:%G' "$CONF"))"
+  [ -n "$(find "$CONF" -perm -o+r 2>/dev/null)" ] && warn "$CONF holds the database password and every account can read it"
+  DB_SRV=$(cs_get "data source|server|address|addr|network address")
+  DB_DB=$(cs_get "initial catalog|database")
+  DB_USR=$(cs_get "user id|uid|user|username")
+  DB_PW=$(cs_get "password|pwd")
+  DB_INTEG=$(cs_get "integrated security|trusted_connection")
+  host=${DB_SRV#tcp:}; host=${host%%,*}; host=${host%%\\*}
+  port=1433; case "$DB_SRV" in *,*) port=${DB_SRV##*,} ;; esac
+  info "Database server: $DB_SRV ($(getent hosts "$host" | awk '{print $1}' | head -n 1))   database: ${DB_DB:-?}   login: ${DB_USR:-?}"
+  printf '%s %s %s\n' "$DB_SRV" "$DB_DB" "$DB_USR" > "$SNAP/db-connection.txt"
+  [ "${DB_USR,,}" = "sa" ] && warn "The store logs in to SQL Server as 'sa' (full control of the whole SQL server)"
+  if timeout 4 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then ok "Database server $host:$port is reachable"
+  else warn "Cannot reach the database server $host:$port (the store will break)"; fi
 
-  q "SELECT CONCAT(username,' | ',email,' | status ',status,' | added ',date_added) FROM \`$DB_NAME\`.\`${DB_PREFIX}user\` ORDER BY user_id" > "$SNAP/opencart-admins.txt"
-  info "OpenCart admin users:"; indent < "$SNAP/opencart-admins.txt"
-  read -r np no nc < <(q "SELECT (SELECT COUNT(*) FROM \`$DB_NAME\`.\`${DB_PREFIX}product\`), (SELECT COUNT(*) FROM \`$DB_NAME\`.\`${DB_PREFIX}order\`), (SELECT COUNT(*) FROM \`$DB_NAME\`.\`${DB_PREFIX}customer\`)")
-  info "Store data: ${np:-?} products, ${no:-?} orders, ${nc:-?} customers"
-  echo "${np:-} ${no:-} ${nc:-}" > "$SNAP/store-counts.dat"
-  if [ -n "$PREV" ] && [ -s "$PREV/store-counts.dat" ]; then
-    read -r pnp pno _ < "$PREV/store-counts.dat"
-    [ -n "$np" ] && [ -n "$pnp" ] && [ "$np" -lt "$pnp" ] && warn "Products dropped from $pnp to $np since last run"
-    [ -n "$no" ] && [ -n "$pno" ] && [ "$no" -lt "$pno" ] && warn "Orders dropped from $pno to $no since last run"
+  if [ ! -x "$SQLCMD" ]; then
+    info "sqlcmd not installed, so store admins and data are not checked. To enable:"
+    info "  sudo curl -o /etc/yum.repos.d/mssql-release.repo https://packages.microsoft.com/config/rhel/9/prod.repo"
+    info "  sudo ACCEPT_EULA=Y dnf install -y mssql-tools18"
+  elif [ -n "$DB_INTEG" ] && [ "${DB_INTEG,,}" != "false" ]; then
+    info "The store uses Windows login to SQL Server, so store data can't be checked from here"
+  else
+    mq() { SQLCMDPASSWORD="$DB_PW" "$SQLCMD" -S "$DB_SRV" -U "$DB_USR" -d "$DB_DB" -C -l 5 -W -h -1 -s '|' -Q "SET NOCOUNT ON; $1" 2>&1; }
+    test_out=$(mq "SELECT 1" | tr -d '[:space:]')
+    if [ "$test_out" != 1 ]; then
+      warn "Could not query the store database with the store's login: $(mq "SELECT 1" | head -n 1 | cut -c1-120)"
+    else
+      ok "Logged in to the store database as $DB_USR"
+      [ "$(mq "SELECT IS_SRVROLEMEMBER('sysadmin')" | tr -d '[:space:]')" = 1 ] && warn "The store's SQL login is a sysadmin on the SQL server (it only needs its own database)"
+      mq "SELECT c.Id, ISNULL(c.Username,''), ISNULL(c.Email,''), CASE c.Active WHEN 1 THEN 'active' ELSE 'disabled' END FROM Customer c JOIN Customer_CustomerRole_Mapping m ON m.Customer_Id = c.Id JOIN CustomerRole r ON r.Id = m.CustomerRole_Id WHERE r.SystemName = 'Administrators' AND c.Deleted = 0 ORDER BY c.Id" > "$SNAP/store-admins.txt"
+      info "Store admin accounts (id | username | email | status):"; indent < "$SNAP/store-admins.txt"
+      [ "$(grep -c . "$SNAP/store-admins.txt")" -gt 1 ] && warn "There are $(grep -c . "$SNAP/store-admins.txt") store admin accounts; make sure you know every one"
+      IFS='|' read -r np no nc < <(mq "SELECT (SELECT COUNT(*) FROM Product WHERE Deleted = 0), (SELECT COUNT(*) FROM [Order] WHERE Deleted = 0), (SELECT COUNT(*) FROM Customer WHERE Deleted = 0 AND Email IS NOT NULL)")
+      info "Store data: ${np:-?} products, ${no:-?} orders, ${nc:-?} registered customers"
+      echo "${np:-} ${no:-} ${nc:-}" > "$SNAP/store-counts.dat"
+      if [ -n "$PREV" ] && [ -s "$PREV/store-counts.dat" ]; then
+        read -r pnp pno _ < "$PREV/store-counts.dat"
+        [ -n "$np" ] && [ -n "$pnp" ] && [ "$np" -lt "$pnp" ] 2>/dev/null && warn "Products dropped from $pnp to $np since last run"
+        [ -n "$no" ] && [ -n "$pno" ] && [ "$no" -lt "$pno" ] 2>/dev/null && warn "Orders dropped from $pno to $no since last run"
+      fi
+    fi
   fi
 fi
-unset MYSQL_PWD
-[ -f /var/log/mariadb/mariadb.log ] && { info "Last MariaDB log lines:"; tail -n 4 /var/log/mariadb/mariadb.log | cut -c1-170 | indent; }
+unset DB_PW
+
+# ==========================================================================
+section "SNMP, LOGGING AND DOMAIN"
+SNMPCONF=/etc/snmp/snmpd.conf
+if systemctl is-active --quiet snmpd; then ok "snmpd is running"; else warn "snmpd is NOT running"; fi
+if [ -f "$SNMPCONF" ]; then
+  grep -vE '^[[:space:]]*(#|$)' "$SNMPCONF" > "$SNAP/snmpd-config.txt"
+  warn_each "SNMP uses a default community name" < <(grep -iwE 'public|private' "$SNAP/snmpd-config.txt")
+  warn_each "SNMP allows changes (should be read-only)" < <(grep -iE '^[[:space:]]*(rwcommunity|rwuser)' "$SNAP/snmpd-config.txt"; awk '$1 == "access" && $8 != "none"' "$SNAP/snmpd-config.txt")
+fi
+if pgrep -x splunkd >/dev/null; then ok "Splunk forwarder is running"
+elif [ -d /opt/splunkforwarder ]; then warn "Splunk forwarder is installed but NOT running (logs aren't being sent)"; fi
+if systemctl cat sssd >/dev/null 2>&1; then
+  if systemctl is-active --quiet sssd; then ok "sssd (domain logins) is running"; else warn "sssd is NOT running (domain users can't log in)"; fi
+  have realm && realm list 2>/dev/null | grep -E 'domain-name|login-policy|permitted-' | indent
+fi
 
 # ==========================================================================
 section "SELINUX, SSH AND LOGINS"
@@ -324,16 +380,16 @@ info "$(wc -l < "$SNAP/suid-files.txt") SUID/SGID programs found"
 warn_each "SUID/SGID program not from any package (root backdoor?)" < <(unowned "${suid[@]}")
 if have rpm; then
   info "Checking core programs against their packages..."
-  warn_each "System program was modified" < <(rpm -V coreutils procps-ng iproute openssh-server openssh-clients sudo shadow-utils util-linux passwd bash findutils grep sed gawk httpd mariadb-server php-fpm 2>/dev/null | awk '$1 ~ /5/ && $2 != "c" {print $NF}')
+  warn_each "System program was modified" < <(rpm -V coreutils procps-ng iproute openssh-server openssh-clients sudo shadow-utils util-linux passwd bash findutils grep sed gawk nginx net-snmp 2>/dev/null | awk '$1 ~ /5/ && $2 != "c" {print $NF}')
 fi
 warn_each "Suspicious file in a temp folder" < <(find /tmp /var/tmp /dev/shm -xdev -type f ! -name '.X*-lock' \( -perm -u+x -o -name '.*' -o -iname '*.sh' -o -iname '*.php' -o -iname '*.py' -o -iname '*.pl' \) 2>/dev/null)
 
 # ==========================================================================
 section "BACKUPS"
 latest=""
-for d in /root/backups/*/; do [ -d "$d" ] && latest=${d%/}; done
+for d in "$BACKUP_DIR"/*/; do [ -d "$d" ] && latest=${d%/}; done
 if [ -z "$latest" ]; then
-  warn "No backups found in /root/backups"
+  warn "No backups found in $BACKUP_DIR"
 else
   age=$(( ($(date +%s) - $(stat -c %Y "$latest")) / 60 ))
   info "Newest backup: $latest ($age minutes old)"
@@ -341,11 +397,8 @@ else
   if [ -f "$latest/SHA256SUMS" ]; then
     if (cd "$latest" && sha256sum -c --quiet SHA256SUMS >/dev/null 2>&1); then ok "Newest backup passes its checksum check"
     else warn "Newest backup FAILS its checksum check (tampered or damaged)"; fi
-  else
-    warn "Newest backup has no SHA256SUMS file"
   fi
 fi
-if crontab -l 2>/dev/null | grep -q 'backup.sh'; then ok "Automatic backup is scheduled"; else warn "No automatic backup in root's crontab"; fi
 
 # ==========================================================================
 section "CHANGES SINCE LAST RUN"
