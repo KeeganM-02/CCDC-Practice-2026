@@ -1,0 +1,29 @@
+Add an additional repository and remove an old one.
+List enabled repos:
+•	sudo dnf repolist
+
+List enabled and disabled repos:
+•	sudo dnf repolist all
+
+Add a repo:
+•	sudo nano /etc/yum.repos.d/example.repo
+•	[example-repo]
+•	name=Example Repository
+•	baseurl=https://example.com/repo/rocky/9/
+•	enabled=1
+•	gpgcheck=1
+•	gpgkey=https://example.com/repo/RPM-GPG-KEY
+
+Disable a repo:
+•	sudo dnf config-manager --set-disabled example-repo
+
+Enable a repo:
+•	sudo dnf config-manager --set-enabled example-repo
+
+Remove the repo:
+•	ls /etc/yum.repos.d/
+•	sudo rm /etc/yum.repos.d/example.repo
+
+Refresh dnf:
+•	sudo dnf clean all
+•	sudo dnf makecache
